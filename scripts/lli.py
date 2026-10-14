@@ -1,0 +1,444 @@
+﻿"""
+PvP Input Anti-Tamper Vault
+A consent-based, visibly indicated input-session recorder for Windows/macOS/Linux.
+
+Install optional input listener dependency:
+    python -m pip install pynput
+
+Notes:
+- Events are held in RAM while recording. No event log is written until export.
+- pynput may require accessibility/input-monitoring permissions on some systems.
+- Read-only permissions are an accidental-edit deterrent, NOT true immutability.
+- A hash detects later content changes only if the expected hash is stored separately;
+  it does not prove that the recorded events are complete or truthful.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import secrets
+import stat
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from pynput import keyboard, mouse
+except ImportError:
+    keyboard = mouse = None
+
+
+BG = "#1E1E1E"
+PANEL = "#292929"
+FG = "#EAEAEA"
+MUTED = "#AAAAAA"
+ACCENT = "#3D8BFF"
+GREEN = "#43C17A"
+RED = "#E05D5D"
+
+# Default profile configured to the player's stated Crystal PvP keybinds.
+# pynput names single-character keys as Key.q, Key.1, etc.; modifiers use
+# names such as Key.ctrl_l / Key.ctrl_r.
+DEFAULT_KEYBINDS = {
+    "Key.q": "CRYSTAL",
+    "Key.f": "SWORD",
+    "Key.e": "OBSIDIAN",
+    "Key.ctrl_l": "TOTEM",
+    "Key.ctrl_r": "TOTEM",
+    "Key.4": "GAP",
+    "Key.1": "ENDERPEARL",
+    "Key.3": "AXE",
+    "Key.tab": "GLOWSTONE",
+    "Key.g": "ANCHOR",
+    "Key.r": "INVENTORY",
+    "Key.v": "OFFHAND",
+    "Key.w": "MOVE_FORWARD",
+    "Key.a": "MOVE_LEFT",
+    "Key.s": "MOVE_BACK",
+    "Key.d": "MOVE_RIGHT",
+    "Key.esc": "MENU",
+}
+DEFAULT_MOUSEBINDS = {
+    "Button.left": "BREAK",
+    "Button.right": "PLACE",
+    "Button.middle": "MIDDLE_CLICK",
+}
+
+
+class InputVaultApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("PvP Input Anti-Tamper Vault")
+        root.geometry("760x590")
+        root.minsize(680, 520)
+        root.configure(bg=BG)
+
+        self.lock = threading.Lock()
+        self.events: list[str] = []
+        self.recording = False
+        self.session_start = None
+        self.session_initialized_at = None
+        self.session_password = "—"
+        self.last_hash = "—"
+        self.keyboard_listener = None
+        self.mouse_listener = None
+        self.key_down = set()
+        self.keybinds = dict(DEFAULT_KEYBINDS)
+        self.mousebinds = dict(DEFAULT_MOUSEBINDS)
+
+        self._build_ui()
+        self._set_status(False)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(150, self._refresh_count)
+
+    def _build_ui(self):
+        tk.Label(
+            self.root, text="PvP INPUT ANTI-TAMPER VAULT",
+            bg=BG, fg=FG, font=("Segoe UI", 18, "bold")
+        ).pack(anchor="w", padx=22, pady=(18, 3))
+        tk.Label(
+            self.root, text="Visible, user-controlled session capture • RAM buffer until export",
+            bg=BG, fg=MUTED, font=("Segoe UI", 10)
+        ).pack(anchor="w", padx=23, pady=(0, 16))
+
+        status = tk.Frame(self.root, bg=PANEL, padx=16, pady=12)
+        status.pack(fill="x", padx=20)
+        self.status_dot = tk.Label(status, text="●", bg=PANEL, fg=RED, font=("Segoe UI", 15))
+        self.status_dot.grid(row=0, column=0, sticky="w")
+        self.status_var = tk.StringVar(value="IDLE")
+        tk.Label(status, textvariable=self.status_var, bg=PANEL, fg=FG,
+                 font=("Segoe UI", 11, "bold")).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.count_var = tk.StringVar(value="0 events in RAM")
+        tk.Label(status, textvariable=self.count_var, bg=PANEL, fg=MUTED).grid(
+            row=0, column=2, sticky="e", padx=(10, 0)
+        )
+        status.columnconfigure(2, weight=1)
+
+        info = tk.Frame(self.root, bg=BG)
+        info.pack(fill="x", padx=22, pady=14)
+        tk.Label(info, text="Session password key", bg=BG, fg=MUTED).grid(row=0, column=0, sticky="w")
+        self.password_var = tk.StringVar(value="—")
+        tk.Label(info, textvariable=self.password_var, bg=BG, fg=FG,
+                 font=("Consolas", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(2, 10))
+        tk.Label(info, text="SHA-256 preview", bg=BG, fg=MUTED).grid(row=2, column=0, sticky="w")
+        self.hash_var = tk.StringVar(value="—")
+        tk.Label(info, textvariable=self.hash_var, bg=BG, fg=FG,
+                 font=("Consolas", 10)).grid(row=3, column=0, sticky="w", pady=(2, 0))
+
+        controls = tk.Frame(self.root, bg=BG)
+        controls.pack(fill="x", padx=20, pady=(0, 12))
+        self.record_btn = tk.Button(
+            controls, text="Start Recording", command=self.toggle_recording,
+            bg=GREEN, fg="#101010", activebackground="#5BD891",
+            relief="flat", padx=16, pady=10, font=("Segoe UI", 10, "bold")
+        )
+        self.record_btn.pack(side="left", padx=(0, 10))
+        tk.Button(
+            controls, text="Generate, Lock & Copy Proof", command=self.export_proof,
+            bg=ACCENT, fg="white", activebackground="#5A9CFF",
+            relief="flat", padx=16, pady=10, font=("Segoe UI", 10, "bold")
+        ).pack(side="left", padx=(0, 10))
+        tk.Button(
+            controls, text="Configure Keybinds", command=self.configure_keybinds,
+            bg="#444444", fg=FG, activebackground="#555555",
+            relief="flat", padx=14, pady=10
+        ).pack(side="left")
+
+        tk.Label(self.root, text="Session activity", bg=BG, fg=MUTED).pack(
+            anchor="w", padx=22, pady=(3, 5)
+        )
+        self.activity = tk.Text(
+            self.root, height=8, bg="#151515", fg="#D6D6D6",
+            insertbackground=FG, relief="flat", wrap="word",
+            font=("Consolas", 9), state="disabled"
+        )
+        self.activity.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        tk.Label(
+            self.root,
+            text="Recording is explicit and visible. Do not record other people's input without permission.",
+            bg=BG, fg=MUTED, font=("Segoe UI", 9)
+        ).pack(anchor="w", padx=22, pady=(0, 14))
+
+    def _append_activity(self, text: str):
+        def update():
+            self.activity.configure(state="normal")
+            self.activity.insert("end", text + "\n")
+            self.activity.see("end")
+            self.activity.configure(state="disabled")
+        self.root.after(0, update)
+
+    def _set_status(self, active: bool):
+        self.recording = active
+        if active:
+            self.status_var.set("RECORDING IN RAM")
+            self.status_dot.configure(fg=GREEN)
+            self.record_btn.configure(text="Stop Recording", bg=RED)
+        else:
+            self.status_var.set("IDLE")
+            self.status_dot.configure(fg=RED)
+            self.record_btn.configure(text="Start Recording", bg=GREEN)
+
+    @staticmethod
+    def _key_name(key):
+        # Normalize printable characters and Windows control-character key
+        # events (for example Ctrl+W can surface as a non-printable char).
+        # Prefer the virtual-key code for non-printable character events.
+        char = getattr(key, "char", None)
+        if isinstance(char, str) and char and char.isprintable():
+            return f"Key.{char.lower()}"
+
+        vk = getattr(key, "vk", None)
+        if isinstance(vk, int):
+            if 0x41 <= vk <= 0x5A:  # A-Z
+                return f"Key.{chr(vk).lower()}"
+            if 0x30 <= vk <= 0x39:  # 0-9
+                return f"Key.{chr(vk)}"
+            special = {
+                0x08: "Key.backspace", 0x09: "Key.tab", 0x0D: "Key.enter",
+                0x1B: "Key.esc", 0x20: "Key.space", 0x21: "Key.page_up",
+                0x22: "Key.page_down", 0x23: "Key.end", 0x24: "Key.home",
+                0x25: "Key.left", 0x26: "Key.up", 0x27: "Key.right",
+                0x28: "Key.down", 0x2D: "Key.insert", 0x2E: "Key.delete",
+            }
+            if vk in special:
+                return special[vk]
+        return str(key)
+
+    def _stamp(self):
+        # Use one wall-clock source for both seconds and milliseconds. The old
+        # mix of wall-clock seconds and perf_counter fractions caused apparent
+        # timestamp jumps such as .904 followed by .048 in the same second.
+        return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    def _record(self, event_type: str, physical: str, mapped: str):
+        # Timestamp and append while holding the shared lock so keyboard and
+        # mouse listener threads do not append records in a different order.
+        with self.lock:
+            if not self.recording:
+                return
+            line = f"[{self._stamp()}] | {event_type:<15} | Physical: {physical} (Mapped: {mapped})"
+            self.events.append(line)
+
+    def _on_key_press(self, key):
+        name = self._key_name(key)
+        if name in self.key_down:
+            return
+        self.key_down.add(name)
+        self._record("KEY_DOWN", name, self.keybinds.get(name, "UNMAPPED"))
+
+    def _on_key_release(self, key):
+        name = self._key_name(key)
+        self.key_down.discard(name)
+        self._record("KEY_UP", name, self.keybinds.get(name, "UNMAPPED"))
+
+    def _on_click(self, x, y, button, pressed):
+        name = str(button)
+        kind = ("MOUSE_" + name.upper().replace("BUTTON.", "") + ("_DOWN" if pressed else "_UP"))
+        self._record(kind, name, self.mousebinds.get(name, "UNMAPPED"))
+
+    def toggle_recording(self):
+        if self.recording:
+            self._stop_listeners()
+            self._set_status(False)
+            self._append_activity("Recording stopped. Events remain in RAM until export or discard.")
+            return
+        if keyboard is None:
+            messagebox.showerror(
+                "Missing dependency",
+                "Install pynput first:\n\npython -m pip install pynput\n\nThen restart this app."
+            )
+            return
+        self.session_start = time.perf_counter()
+        self.session_initialized_at = datetime.now()
+        self.session_password = secrets.token_hex(4).upper()
+        self.password_var.set(self.session_password)
+        self.last_hash = "—"
+        self.hash_var.set("—")
+        with self.lock:
+            self.events.clear()
+        self.key_down.clear()
+        try:
+            self.keyboard_listener = keyboard.Listener(
+                on_press=self._on_key_press, on_release=self._on_key_release
+            )
+            self.mouse_listener = mouse.Listener(on_click=self._on_click)
+            self.keyboard_listener.start()
+            self.mouse_listener.start()
+            self._set_status(True)
+            self._append_activity("Recording started. Input events are buffered in RAM.")
+        except Exception as exc:
+            self._stop_listeners()
+            self._set_status(False)
+            messagebox.showerror("Listener could not start", str(exc))
+
+    def _stop_listeners(self):
+        for listener in (self.keyboard_listener, self.mouse_listener):
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+        self.keyboard_listener = self.mouse_listener = None
+
+    def configure_keybinds(self):
+        win = tk.Toplevel(self.root)
+        win.title("Custom Keybind Profile")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.grab_set()
+        tk.Label(
+            win, text="Enter physical key names and mapped game actions.",
+            bg=BG, fg=FG, wraplength=420, justify="left"
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+        tk.Label(
+            win, text="Examples: Key.space = PLACE, Key.shift = JUMP, Button.right = PLACE",
+            bg=BG, fg=MUTED, wraplength=420, justify="left"
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+        text = tk.Text(win, width=52, height=14, bg="#151515", fg=FG,
+                       insertbackground=FG, relief="flat", font=("Consolas", 10))
+        text.pack(padx=16, pady=4)
+        lines = [f"{k} = {v}" for k, v in self.keybinds.items()]
+        lines += [f"{k} = {v}" for k, v in self.mousebinds.items()]
+        text.insert("1.0", "\n".join(lines))
+
+        def save():
+            keys, mice = {}, {}
+            try:
+                for line in text.get("1.0", "end").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    physical, action = line.split("=", 1)
+                    physical, action = physical.strip(), action.strip().upper()
+                    if not physical or not action:
+                        raise ValueError("Each non-empty line needs a key and an action.")
+                    if physical.startswith("Button."):
+                        mice[physical] = action
+                    else:
+                        keys[physical] = action
+            except ValueError as exc:
+                messagebox.showerror("Invalid profile", str(exc), parent=win)
+                return
+            self.keybinds, self.mousebinds = keys, mice
+            self._append_activity("Custom keybind profile updated.")
+            win.destroy()
+
+        tk.Button(win, text="Save Profile", command=save, bg=ACCENT, fg="white",
+                  relief="flat", padx=14, pady=8).pack(pady=(8, 14))
+
+    def export_proof(self):
+        if self.recording:
+            self._stop_listeners()
+            self._set_status(False)
+        with self.lock:
+            snapshot = list(self.events)
+            self.events.clear()  # flush the live RAM buffer into this export snapshot
+
+        if self.session_start is None:
+            messagebox.showinfo("No session", "Start a recording session before exporting proof.")
+            return
+
+        desktop = Path(os.path.expanduser("~/Desktop"))
+        proof_dir = desktop / "input_proof"
+
+        try:
+            proof_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            with self.lock:
+                self.events.extend(snapshot)
+            messagebox.showerror(
+                "Folder error",
+                f"Could not create the proof folder:\n{proof_dir}\n\n{exc}"
+            )
+            return
+
+        default_name = f"pvp_input_proof_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        path_obj = proof_dir / default_name
+        password = self.session_password
+        profile = ", ".join([f"{k.removeprefix('Key.')}={v}" for k, v in self.keybinds.items()])
+        profile += (", " if profile else "") + ", ".join(
+            f"{k}={v}" for k, v in self.mousebinds.items()
+        )
+        header = (
+            "====================================================================\n"
+            "           SECURE PVP INPUT PROOF & ANTI-TAMPER VAULT                \n"
+            f" Session Initialized: {(self.session_initialized_at or datetime.now()).strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f" Security Password Key: {password}\n"
+            f" Custom Keybind Profile: {profile}\n"
+            "====================================================================\n"
+        )
+        body = "\n".join(snapshot)
+        content_without_hash = header + body + ("\n" if body else "")
+        digest = hashlib.sha256(content_without_hash.encode("utf-8")).hexdigest()
+        full_content = (
+            content_without_hash
+            + "--------------------------------------------------------------------\n"
+            + f"INTEGRITY HASH (SHA-256): {digest}\n"
+            + "VERIFICATION STATUS: READ-ONLY PERMISSIONS SET; HASH CALCULATED AT EXPORT\n"
+            + "====================================================================\n"
+        )
+
+        try:
+            # Clear the read-only flag first if a file already exists.
+            if path_obj.exists():
+                try:
+                    os.chmod(path_obj, stat.S_IWRITE | stat.S_IREAD)
+                except OSError:
+                    pass
+            path_obj.write_text(full_content, encoding="utf-8")
+            os.chmod(path_obj, stat.S_IREAD)
+        except OSError as exc:
+            with self.lock:
+                self.events.extend(snapshot)
+            messagebox.showerror("Export failed", f"Could not write/lock the proof file:\n{exc}")
+            return
+
+        self.last_hash = digest
+        self.hash_var.set(digest[:16] + "…")
+        summary = (
+            "PvP Input Proof\n"
+            f"File: {path_obj.resolve()}\n"
+            f"Session password: {password}\n"
+            f"SHA-256: {digest}\n"
+        )
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(summary)
+            self.root.update()
+            clipboard_msg = "File path, session key, and SHA-256 copied to clipboard."
+        except tk.TclError:
+            clipboard_msg = "Clipboard unavailable; summary could not be copied."
+        self._append_activity(f"Exported {len(snapshot)} events. SHA-256: {digest}")
+        messagebox.showinfo(
+            "Proof exported",
+            f"Saved: {path_obj}\n\nSHA-256:\n{digest}\n\n{clipboard_msg}\n\n"
+            "Note: read-only permissions are not cryptographic immutability."
+        )
+        self.session_start = None
+        self.session_initialized_at = None
+        self.password_var.set(password)
+
+    def _refresh_count(self):
+        with self.lock:
+            count = len(self.events)
+        self.count_var.set(f"{count} events in RAM")
+        self.root.after(150, self._refresh_count)
+
+    def _on_close(self):
+        if self.recording:
+            self._stop_listeners()
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    InputVaultApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
